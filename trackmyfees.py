@@ -10,15 +10,20 @@
 import mysql.connector
 from mysql.connector import Error
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+from getpass import getpass
+import sys
 
 
 # --------------------------------------------------
-#  CONFIGURATION  -- change password if needed
+#  CONFIGURATION
 # --------------------------------------------------
 DB_HOST = "localhost"
 DB_USER = "root"
-DB_PASS = "tiger"       # <-- set your MySQL root password here
 DB_NAME = "trackmyfees"
+
+# Prompt for password instead of hardcoding
+DB_PASS = getpass("  Enter MySQL password: ")
 
 
 # --------------------------------------------------
@@ -48,8 +53,8 @@ def setup_database():
             host=DB_HOST, user=DB_USER, password=DB_PASS
         )
         cur = con.cursor()
-        cur.execute("CREATE DATABASE IF NOT EXISTS trackmyfees")
-        cur.execute("USE trackmyfees")
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
+        cur.execute(f"USE {DB_NAME}")
 
         cur.execute(
             "CREATE TABLE IF NOT EXISTS courses ("
@@ -73,10 +78,12 @@ def setup_database():
 
         cur.execute(
             "CREATE TABLE IF NOT EXISTS enrollments ("
+            "  enrollment_id   INT AUTO_INCREMENT PRIMARY KEY,"
             "  student_id      INT NOT NULL,"
             "  course_id       INT NOT NULL,"
             "  enrollment_date DATE NOT NULL,"
-            "  PRIMARY KEY (student_id, course_id),"
+            "  end_date        DATE DEFAULT NULL,"
+            "  UNIQUE (student_id, course_id, enrollment_date),"
             "  FOREIGN KEY (student_id) REFERENCES students(student_id)"
             "    ON DELETE CASCADE,"
             "  FOREIGN KEY (course_id) REFERENCES courses(course_id)"
@@ -91,12 +98,13 @@ def setup_database():
             "  course_id    INT           NOT NULL,"
             "  amount_paid  DECIMAL(10,2) NOT NULL,"
             "  payment_date DATE          NOT NULL,"
-            "  fee_month    VARCHAR(20)   NOT NULL,"
+            "  fee_month    DATE          NOT NULL,"
             "  remarks      VARCHAR(200)  DEFAULT '',"
+            "  UNIQUE (student_id, course_id, fee_month),"
             "  FOREIGN KEY (student_id) REFERENCES students(student_id)"
             "    ON DELETE CASCADE,"
             "  FOREIGN KEY (course_id) REFERENCES courses(course_id)"
-            "    ON DELETE CASCADE"
+            "    ON DELETE RESTRICT"
             ")"
         )
 
@@ -106,7 +114,7 @@ def setup_database():
     except Error as e:
         print(f"\n  [SETUP ERROR] {e}")
         print("  Make sure MySQL is running and credentials are correct.\n")
-        exit(1)
+        sys.exit(1)
 
 
 # --------------------------------------------------
@@ -121,6 +129,18 @@ def heading(title):
 def pause():
     input("\n  Press ENTER to return to menu...")
 
+def get_nonempty(prompt, max_len=None):
+    """Get non-empty input, optionally with max length."""
+    while True:
+        val = input(prompt).strip()
+        if not val:
+            print("  This field cannot be empty.")
+            continue
+        if max_len and len(val) > max_len:
+            print(f"  Too long. Maximum {max_len} characters.")
+            continue
+        return val
+
 def get_int(prompt, minimum=1):
     while True:
         try:
@@ -131,57 +151,114 @@ def get_int(prompt, minimum=1):
         except ValueError:
             print("  Invalid. Enter a whole number.")
 
-def get_float(prompt, minimum=0.01):
-    while True:
-        try:
-            val = float(input(prompt))
-            if val >= minimum:
-                return val
-            print(f"  Amount must be >= {minimum}.")
-        except ValueError:
-            print("  Invalid. Enter a number (e.g. 1500 or 1500.50).")
-
-def get_date(prompt):
+def get_decimal(prompt, minimum=Decimal("0.01")):
+    """Get a Decimal value, rejecting inf/nan and out-of-range."""
     while True:
         raw = input(prompt).strip()
         try:
-            return datetime.strptime(raw, "%Y-%m-%d").date()
+            val = Decimal(raw)
+            if val.is_nan() or val.is_infinite():
+                print("  Invalid amount.")
+                continue
+            if val < minimum:
+                print(f"  Amount must be >= {minimum}.")
+                continue
+            if val > Decimal("99999999.99"):
+                print("  Amount too large. Maximum 99,999,999.99.")
+                continue
+            return val
+        except InvalidOperation:
+            print("  Invalid. Enter a number (e.g. 1500 or 1500.50).")
+
+def get_date(prompt, allow_future=False):
+    while True:
+        raw = input(prompt).strip()
+        try:
+            d = datetime.strptime(raw, "%Y-%m-%d").date()
+            if not allow_future and d > date.today():
+                print("  Date cannot be in the future.")
+                continue
+            return d
         except ValueError:
             print("  Format: YYYY-MM-DD  (e.g. 2025-04-01)")
+
+def get_month(prompt):
+    """Get a month as YYYY-MM, return as date (1st of month)."""
+    while True:
+        raw = input(prompt).strip()
+        try:
+            d = datetime.strptime(raw + "-01", "%Y-%m-%d").date()
+            return d
+        except ValueError:
+            print("  Format: YYYY-MM  (e.g. 2025-04)")
+
+def safe_execute(cur, query, params=None):
+    """Execute with error handling. Returns True on success."""
+    try:
+        cur.execute(query, params or ())
+        return True
+    except Error as e:
+        print(f"  [DB ERROR] {e}")
+        return False
 
 
 # --------------------------------------------------
 #  ENROLLMENT HELPERS
 # --------------------------------------------------
 
-def get_student_enrollments(cur, sid):
-    """Return list of (course_id, course_name, subject, tutor_name, monthly_fee) for a student."""
-    cur.execute(
-        "SELECT c.course_id, c.course_name, c.subject, c.tutor_name, c.monthly_fee"
+def get_student_enrollments(cur, sid, active_only=False):
+    """Return list of (course_id, course_name, subject, tutor_name, monthly_fee, enrollment_date)."""
+    q = (
+        "SELECT c.course_id, c.course_name, c.subject, c.tutor_name, c.monthly_fee, e.enrollment_date"
         " FROM enrollments e"
         " JOIN courses c ON e.course_id = c.course_id"
         " WHERE e.student_id = %s"
-        " ORDER BY c.course_id",
-        (sid,)
     )
+    if active_only:
+        q += " AND e.end_date IS NULL"
+    q += " ORDER BY c.course_id"
+    cur.execute(q, (sid,))
     return cur.fetchall()
 
 
-def enroll_student_in_course(cur, sid, cid, enroll_date=None):
-    """Enroll a student in a course. Returns True if newly enrolled, False if already."""
+def get_months_between(start_date, end_date):
+    """Return list of (year, month) tuples from start to end inclusive."""
+    months = []
+    y, m = start_date.year, start_date.month
+    while (y, m) <= (end_date.year, end_date.month):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return months
+
+
+def get_paid_months(cur, sid, cid):
+    """Return set of (year, month) tuples that have been paid."""
     cur.execute(
-        "SELECT 1 FROM enrollments WHERE student_id=%s AND course_id=%s",
+        "SELECT fee_month FROM payments WHERE student_id=%s AND course_id=%s",
         (sid, cid)
     )
-    if cur.fetchone():
-        return False
-    if enroll_date is None:
-        enroll_date = date.today()
+    return {(r[0].year, r[0].month) for r in cur.fetchall()}
+
+
+def calculate_dues(cur, sid, cid, enrollment_date, monthly_fee):
+    """Calculate dues for a student in a course. Returns (expected, paid, balance, unpaid_months)."""
+    today = date.today()
+    months = get_months_between(enrollment_date, today)
+    expected = monthly_fee * len(months)
+    paid_months = get_paid_months(cur, sid, cid)
     cur.execute(
-        "INSERT INTO enrollments (student_id, course_id, enrollment_date) VALUES (%s,%s,%s)",
-        (sid, cid, enroll_date)
+        "SELECT COALESCE(SUM(amount_paid),0) FROM payments WHERE student_id=%s AND course_id=%s",
+        (sid, cid)
     )
-    return True
+    paid = cur.fetchone()[0]
+    if paid is None:
+        paid = Decimal("0")
+    balance = expected - paid
+    unpaid = [m for m in months if m not in paid_months]
+    return expected, paid, balance, unpaid
 
 
 # --------------------------------------------------
@@ -194,16 +271,18 @@ def add_course():
     if not con:
         return
     cur = con.cursor()
-    name    = input("  Course / Batch name   : ").strip()
-    subject = input("  Subject               : ").strip()
-    tutor   = input("  Tutor name            : ").strip()
-    fee     = get_float("  Monthly fee (Rs.)     : ")
-    cur.execute(
+    name    = get_nonempty("  Course / Batch name   : ", 100)
+    subject = get_nonempty("  Subject               : ", 100)
+    tutor   = get_nonempty("  Tutor name            : ", 100)
+    fee     = get_decimal("  Monthly fee (Rs.)     : ")
+    if safe_execute(cur,
         "INSERT INTO courses (course_name, subject, tutor_name, monthly_fee) VALUES (%s,%s,%s,%s)",
         (name, subject, tutor, fee)
-    )
-    con.commit()
-    print(f"\n  Course '{name}' added. ID = {cur.lastrowid}")
+    ):
+        con.commit()
+        print(f"\n  Course '{name}' added. ID = {cur.lastrowid}")
+    else:
+        con.rollback()
     con.close()
     pause()
 
@@ -223,9 +302,53 @@ def view_courses(pause_after=True):
         print(f"  {'ID':<5} {'Course':<20} {'Subject':<18} {'Tutor':<18} {'Monthly Fee':>12}")
         print("  " + "-" * 60)
         for r in rows:
-            print(f"  {r[0]:<5} {r[1]:<20} {r[2]:<18} {r[3]:<18} {float(r[4]):>12.2f}")
+            print(f"  {r[0]:<5} {r[1]:<20} {r[2]:<18} {r[3]:<18} {r[4]:>12.2f}")
     if pause_after:
         pause()
+
+
+def update_course():
+    heading("Edit Course")
+    view_courses(pause_after=False)
+    con = connect()
+    if not con:
+        return
+    cur = con.cursor()
+    cid = get_int("  Enter Course ID to edit : ")
+    cur.execute("SELECT course_name, subject, tutor_name, monthly_fee FROM courses WHERE course_id=%s", (cid,))
+    row = cur.fetchone()
+    if not row:
+        print("  Course not found.")
+        con.close()
+        pause()
+        return
+    print(f"\n  Current Name    : {row[0]}")
+    print(f"  Current Subject : {row[1]}")
+    print(f"  Current Tutor   : {row[2]}")
+    print(f"  Current Fee     : Rs. {row[3]:.2f}")
+    print("  (Press ENTER to keep existing value)")
+    name    = input("  New name    : ").strip() or row[0]
+    subject = input("  New subject : ").strip() or row[1]
+    tutor   = input("  New tutor   : ").strip() or row[2]
+    fee_raw = input("  New fee     : ").strip()
+    if fee_raw:
+        try:
+            fee = Decimal(fee_raw)
+        except InvalidOperation:
+            print("  Invalid fee. Keeping existing value.")
+            fee = row[3]
+    else:
+        fee = row[3]
+    if safe_execute(cur,
+        "UPDATE courses SET course_name=%s, subject=%s, tutor_name=%s, monthly_fee=%s WHERE course_id=%s",
+        (name, subject, tutor, fee, cid)
+    ):
+        con.commit()
+        print("  Course updated.")
+    else:
+        con.rollback()
+    con.close()
+    pause()
 
 
 def delete_course():
@@ -243,14 +366,23 @@ def delete_course():
         con.close()
         pause()
         return
+    # Check for payments
+    cur.execute("SELECT COUNT(*) FROM payments WHERE course_id=%s", (cid,))
+    pay_count = cur.fetchone()[0]
+    if pay_count > 0:
+        print(f"\n  WARNING: This course has {pay_count} payment record(s).")
+        print("  Deleting it will fail because payments are protected (ON DELETE RESTRICT).")
+        print("  You must delete the payment records first.")
+        con.close()
+        pause()
+        return
     confirm = input(f"  Delete '{row[0]}'? (yes/no) : ").strip().lower()
     if confirm == "yes":
-        try:
-            cur.execute("DELETE FROM courses WHERE course_id=%s", (cid,))
+        if safe_execute(cur, "DELETE FROM courses WHERE course_id=%s", (cid,)):
             con.commit()
             print("  Course deleted.")
-        except Error as e:
-            print(f"  Cannot delete: {e}")
+        else:
+            con.rollback()
     else:
         print("  Cancelled.")
     con.close()
@@ -267,15 +399,19 @@ def add_student():
     if not con:
         return
     cur = con.cursor()
-    name    = input("  Student name          : ").strip()
-    cls     = input("  Class (e.g. XI, XII)  : ").strip()
-    contact = input("  Contact number        : ").strip()
+    name    = get_nonempty("  Student name          : ", 100)
+    cls     = get_nonempty("  Class (e.g. XI, XII)  : ", 20)
+    contact = get_nonempty("  Contact number        : ", 15)
     jdate   = get_date("  Join date (YYYY-MM-DD): ")
 
-    cur.execute(
+    if not safe_execute(cur,
         "INSERT INTO students (name, class, contact, join_date) VALUES (%s,%s,%s,%s)",
         (name, cls, contact, jdate)
-    )
+    ):
+        con.rollback()
+        con.close()
+        pause()
+        return
     sid = cur.lastrowid
     con.commit()
 
@@ -291,11 +427,22 @@ def add_student():
         if not row:
             print("  Invalid Course ID.")
             continue
-        if enroll_student_in_course(cur, sid, cid, jdate):
+        # Check if already actively enrolled
+        cur.execute(
+            "SELECT 1 FROM enrollments WHERE student_id=%s AND course_id=%s AND end_date IS NULL",
+            (sid, cid)
+        )
+        if cur.fetchone():
+            print(f"  Already actively enrolled in '{row[0]}'.")
+            continue
+        if safe_execute(cur,
+            "INSERT INTO enrollments (student_id, course_id, enrollment_date) VALUES (%s,%s,%s)",
+            (sid, cid, jdate)
+        ):
+            con.commit()
             print(f"  Enrolled in '{row[0]}'.")
         else:
-            print(f"  Already enrolled in '{row[0]}'.")
-        con.commit()
+            con.rollback()
 
     print(f"\n  Student '{name}' registered. ID = {sid}")
     con.close()
@@ -310,24 +457,19 @@ def view_students(pause_after=True):
     cur = con.cursor()
     cur.execute("SELECT student_id, name, class, contact, join_date FROM students ORDER BY student_id")
     students = cur.fetchall()
-    con.close()
     if not students:
         print("  No students registered.")
     else:
         for s in students:
             sid, name, cls, contact, jdate = s
             print(f"\n  ID: {sid}  |  {name}  |  Class: {cls}  |  Contact: {contact}  |  Joined: {jdate}")
-            # Show enrollments
-            con = connect()
-            if con:
-                cur = con.cursor()
-                enrolls = get_student_enrollments(cur, sid)
-                con.close()
-                if enrolls:
-                    for e in enrolls:
-                        print(f"      -> {e[1]} ({e[2]}) — Tutor: {e[3]} — Rs. {float(e[4]):.2f}/month")
-                else:
-                    print("      -> No enrollments")
+            enrolls = get_student_enrollments(cur, sid)
+            if enrolls:
+                for e in enrolls:
+                    print(f"      -> {e[1]} ({e[2]}) — Tutor: {e[3]} — Rs. {e[4]:.2f}/month — From: {e[5]}")
+            else:
+                print("      -> No enrollments")
+    con.close()
     if pause_after:
         pause()
 
@@ -335,44 +477,54 @@ def view_students(pause_after=True):
 def search_student():
     heading("Search Student")
     keyword = input("  Enter name, ID, or subject/course keyword : ").strip()
+    if not keyword:
+        print("  Search term cannot be empty.")
+        pause()
+        return
     con = connect()
     if not con:
         return
     cur = con.cursor()
+    # Escape LIKE wildcards
+    escaped = keyword.replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
     if keyword.isdigit():
-        cur.execute(
-            "SELECT s.student_id, s.name, s.class, s.contact, s.join_date"
-            " FROM students s"
-            " WHERE s.student_id=%s", (int(keyword),)
-        )
-    else:
-        like = f"%{keyword}%"
+        # Search by student ID AND also by course name/subject containing the number
         cur.execute(
             "SELECT DISTINCT s.student_id, s.name, s.class, s.contact, s.join_date"
             " FROM students s"
             " LEFT JOIN enrollments e ON s.student_id = e.student_id"
             " LEFT JOIN courses c ON e.course_id = c.course_id"
-            " WHERE s.name LIKE %s OR c.course_name LIKE %s OR c.subject LIKE %s",
+            " WHERE s.student_id=%s"
+            " OR c.course_name LIKE %s ESCAPE '\\\\'"
+            " OR c.subject LIKE %s ESCAPE '\\\\'",
+            (int(keyword), like, like)
+        )
+    else:
+        cur.execute(
+            "SELECT DISTINCT s.student_id, s.name, s.class, s.contact, s.join_date"
+            " FROM students s"
+            " LEFT JOIN enrollments e ON s.student_id = e.student_id"
+            " LEFT JOIN courses c ON e.course_id = c.course_id"
+            " WHERE s.name LIKE %s ESCAPE '\\\\'"
+            " OR c.course_name LIKE %s ESCAPE '\\\\'"
+            " OR c.subject LIKE %s ESCAPE '\\\\'",
             (like, like, like)
         )
     students = cur.fetchall()
-    con.close()
     if not students:
         print("  No records found.")
     else:
         for s in students:
             sid, name, cls, contact, jdate = s
             print(f"\n  ID: {sid}  |  {name}  |  Class: {cls}  |  Contact: {contact}  |  Joined: {jdate}")
-            con = connect()
-            if con:
-                cur = con.cursor()
-                enrolls = get_student_enrollments(cur, sid)
-                con.close()
-                if enrolls:
-                    for e in enrolls:
-                        print(f"      -> {e[1]} ({e[2]}) — Tutor: {e[3]} — Rs. {float(e[4]):.2f}/month")
-                else:
-                    print("      -> No enrollments")
+            enrolls = get_student_enrollments(cur, sid)
+            if enrolls:
+                for e in enrolls:
+                    print(f"      -> {e[1]} ({e[2]}) — Tutor: {e[3]} — Rs. {e[4]:.2f}/month — From: {e[5]}")
+            else:
+                print("      -> No enrollments")
+    con.close()
     pause()
 
 
@@ -398,11 +550,13 @@ def update_student():
     name    = input("  New name    : ").strip() or row[1]
     cls     = input("  New class   : ").strip() or row[2]
     contact = input("  New contact : ").strip() or row[3]
-    cur.execute(
+    if safe_execute(cur,
         "UPDATE students SET name=%s, class=%s, contact=%s WHERE student_id=%s",
         (name, cls, contact, sid)
-    )
-    con.commit()
+    ):
+        con.commit()
+    else:
+        con.rollback()
 
     # Manage enrollments
     while True:
@@ -410,12 +564,12 @@ def update_student():
         enrolls = get_student_enrollments(cur, sid)
         if enrolls:
             for e in enrolls:
-                print(f"      {e[0]}: {e[1]} ({e[2]}) — Tutor: {e[3]}")
+                print(f"      {e[0]}: {e[1]} ({e[2]}) — Tutor: {e[3]} — From: {e[5]}")
         else:
             print("      None")
 
         print("\n  1. Add enrollment")
-        print("  2. Remove enrollment")
+        print("  2. End enrollment")
         print("  0. Done")
         choice = input("  Choice : ").strip()
         if choice == "1":
@@ -426,21 +580,42 @@ def update_student():
             if not crow:
                 print("  Invalid Course ID.")
                 continue
-            if enroll_student_in_course(cur, sid, cid):
+            cur.execute(
+                "SELECT 1 FROM enrollments WHERE student_id=%s AND course_id=%s AND end_date IS NULL",
+                (sid, cid)
+            )
+            if cur.fetchone():
+                print(f"  Already actively enrolled in '{crow[0]}'.")
+                continue
+            if safe_execute(cur,
+                "INSERT INTO enrollments (student_id, course_id, enrollment_date) VALUES (%s,%s,%s)",
+                (sid, cid, date.today())
+            ):
                 con.commit()
                 print(f"  Enrolled in '{crow[0]}'.")
             else:
-                print(f"  Already enrolled in '{crow[0]}'.")
+                con.rollback()
         elif choice == "2":
-            cid = get_int("  Enter Course ID to remove : ")
+            cid = get_int("  Enter Course ID to end enrollment : ")
             cur.execute(
-                "DELETE FROM enrollments WHERE student_id=%s AND course_id=%s",
+                "SELECT 1 FROM enrollments WHERE student_id=%s AND course_id=%s AND end_date IS NULL",
                 (sid, cid)
             )
-            con.commit()
-            print("  Enrollment removed.")
+            if not cur.fetchone():
+                print("  No active enrollment found for that course.")
+                continue
+            if safe_execute(cur,
+                "UPDATE enrollments SET end_date=%s WHERE student_id=%s AND course_id=%s AND end_date IS NULL",
+                (date.today(), sid, cid)
+            ):
+                con.commit()
+                print("  Enrollment ended.")
+            else:
+                con.rollback()
         elif choice == "0":
             break
+        else:
+            print("  Invalid choice.")
 
     print("  Record updated.")
     con.close()
@@ -466,9 +641,11 @@ def delete_student():
         f"  Delete '{row[0]}' and ALL their payment records? (yes/no) : "
     ).strip().lower()
     if confirm == "yes":
-        cur.execute("DELETE FROM students WHERE student_id=%s", (sid,))
-        con.commit()
-        print("  Student deleted.")
+        if safe_execute(cur, "DELETE FROM students WHERE student_id=%s", (sid,)):
+            con.commit()
+            print("  Student deleted.")
+        else:
+            con.rollback()
     else:
         print("  Cancelled.")
     con.close()
@@ -495,18 +672,17 @@ def record_payment():
         pause()
         return
 
-    # Show enrolled courses for selection
-    enrolls = get_student_enrollments(cur, sid)
+    enrolls = get_student_enrollments(cur, sid, active_only=True)
     if not enrolls:
-        print("  Student is not enrolled in any course.")
+        print("  Student is not actively enrolled in any course.")
         con.close()
         pause()
         return
 
     print(f"\n  Student: {srow[0]}")
-    print("  Enrolled courses:")
+    print("  Active enrollments:")
     for e in enrolls:
-        print(f"      {e[0]}: {e[1]} ({e[2]}) — Tutor: {e[3]} — Rs. {float(e[4]):.2f}/month")
+        print(f"      {e[0]}: {e[1]} ({e[2]}) — Tutor: {e[3]} — Rs. {e[4]:.2f}/month")
 
     cid = get_int("  Enter Course ID for payment : ")
     selected = None
@@ -522,16 +698,21 @@ def record_payment():
 
     print(f"\n  Course      : {selected[1]}")
     print(f"  Tutor       : {selected[3]}")
-    print(f"  Monthly Fee : Rs. {float(selected[4]):.2f}")
-    amount  = get_float("  Amount paid (Rs.)         : ")
+    print(f"  Monthly Fee : Rs. {selected[4]:.2f}")
+    amount  = get_decimal("  Amount paid (Rs.)         : ")
     pdate   = get_date( "  Payment date (YYYY-MM-DD)  : ")
-    month   = input(    "  Fee month (e.g. April 2025): ").strip()
+    month   = get_month("  Fee month (YYYY-MM)        : ")
     remarks = input(    "  Remarks (optional)         : ").strip()
-    cur.execute(
+
+    if not safe_execute(cur,
         "INSERT INTO payments (student_id, course_id, amount_paid, payment_date, fee_month, remarks)"
         " VALUES (%s,%s,%s,%s,%s,%s)",
         (sid, cid, amount, pdate, month, remarks)
-    )
+    ):
+        con.rollback()
+        con.close()
+        pause()
+        return
     con.commit()
     pid = cur.lastrowid
     con.close()
@@ -543,7 +724,7 @@ def record_payment():
     print(f"  Student      : {srow[0]}")
     print(f"  Course       : {selected[1]}")
     print(f"  Tutor        : {selected[3]}")
-    print(f"  Fee Month    : {month}")
+    print(f"  Fee Month    : {month.strftime('%B %Y')}")
     print(f"  Amount Paid  : Rs. {amount:.2f}")
     print(f"  Payment Date : {pdate}")
     if remarks:
@@ -568,14 +749,13 @@ def view_payment_history():
         pause()
         return
 
-    # Show all payments across all courses
     cur.execute(
         "SELECT p.payment_id, c.course_name, c.tutor_name, p.fee_month,"
         "       p.amount_paid, p.payment_date, p.remarks"
         " FROM payments p"
         " JOIN courses c ON p.course_id = c.course_id"
         " WHERE p.student_id = %s"
-        " ORDER BY p.payment_date",
+        " ORDER BY p.payment_date, p.payment_id",
         (sid,)
     )
     rows = cur.fetchall()
@@ -585,12 +765,12 @@ def view_payment_history():
     if not rows:
         print("  No payment records found.")
     else:
-        total = 0.0
+        total = Decimal("0")
         print(f"  {'Rec#':<6} {'Course':<18} {'Tutor':<15} {'Month':<14} {'Amount':>10} {'Date':<12} Remarks")
         print("  " + "-" * 90)
         for r in rows:
-            total += float(r[4])
-            print(f"  {r[0]:<6} {r[1]:<18} {r[2]:<15} {r[3]:<14} {float(r[4]):>10.2f} {str(r[5]):<12} {r[6]}")
+            total += r[4]
+            print(f"  {r[0]:<6} {r[1]:<18} {r[2]:<15} {r[3].strftime('%b %Y'):<14} {r[4]:>10.2f} {str(r[5]):<12} {r[6]}")
         print("  " + "-" * 90)
         print(f"  {'TOTAL PAID':>60} : Rs. {total:.2f}")
     pause()
@@ -619,7 +799,7 @@ def delete_payment():
     print(f"\n  {'Rec#':<6} {'Course':<18} {'Month':<14} {'Amount':>10} {'Date'}")
     print("  " + "-" * 60)
     for r in rows:
-        print(f"  {r[0]:<6} {r[1]:<18} {r[2]:<14} {float(r[3]):>10.2f} {r[4]}")
+        print(f"  {r[0]:<6} {r[1]:<18} {r[2].strftime('%b %Y'):<14} {r[3]:>10.2f} {r[4]}")
     pid = get_int("  Enter Receipt # to delete : ")
     cur.execute(
         "SELECT payment_id FROM payments WHERE payment_id=%s AND student_id=%s", (pid, sid)
@@ -631,9 +811,11 @@ def delete_payment():
         return
     confirm = input("  Confirm delete? (yes/no) : ").strip().lower()
     if confirm == "yes":
-        cur.execute("DELETE FROM payments WHERE payment_id=%s", (pid,))
-        con.commit()
-        print("  Payment deleted.")
+        if safe_execute(cur, "DELETE FROM payments WHERE payment_id=%s", (pid,)):
+            con.commit()
+            print("  Payment deleted.")
+        else:
+            con.rollback()
     else:
         print("  Cancelled.")
     con.close()
@@ -667,8 +849,8 @@ def reprint_receipt():
         print(f"  Student      : {r[1]}")
         print(f"  Course       : {r[2]}  ({r[3]})")
         print(f"  Tutor        : {r[4]}")
-        print(f"  Fee Month    : {r[5]}")
-        print(f"  Amount Paid  : Rs. {float(r[6]):.2f}")
+        print(f"  Fee Month    : {r[5].strftime('%B %Y')}")
+        print(f"  Amount Paid  : Rs. {r[6]:.2f}")
         print(f"  Payment Date : {r[7]}")
         if r[8]:
             print(f"  Remarks      : {r[8]}")
@@ -697,37 +879,28 @@ def pending_dues():
     print(f"\n  {'ID':<5} {'Name':<20} {'Tutor':<15}"
           f" {'Expected':>10} {'Paid':>10} {'Balance':>10}")
     print("  " + "-" * 74)
-    g_exp = g_paid = 0.0
+    g_exp = Decimal("0")
+    g_paid = Decimal("0")
     for s in students:
         sid, name = s
-        enrolls = get_student_enrollments(cur, sid)
+        enrolls = get_student_enrollments(cur, sid, active_only=True)
         for e in enrolls:
-            cid, cname, subj, tutor, mfee = e
-            # Use enrollment date for months calculation
-            cur.execute("SELECT enrollment_date FROM enrollments WHERE student_id=%s AND course_id=%s", (sid, cid))
-            edate = cur.fetchone()[0]
-            months = (today.year - edate.year) * 12 + (today.month - edate.month) + 1
-            expected = float(mfee) * months
-            cur.execute(
-                "SELECT COALESCE(SUM(amount_paid),0) FROM payments WHERE student_id=%s AND course_id=%s",
-                (sid, cid)
-            )
-            paid = float(cur.fetchone()[0])
-            bal  = expected - paid
+            cid, cname, subj, tutor, mfee, edate = e
+            expected, paid, balance, unpaid = calculate_dues(cur, sid, cid, edate, mfee)
             g_exp  += expected
             g_paid += paid
-            flag = "  *** DUES ***" if bal > 0 else ""
+            flag = "  *** DUES ***" if balance > 0 else ""
             print(f"  {sid:<5} {name:<20} {tutor:<15}"
-                  f" {expected:>10.2f} {paid:>10.2f} {bal:>10.2f}{flag}")
+                  f" {expected:>10.2f} {paid:>10.2f} {balance:>10.2f}{flag}")
     print("  " + "-" * 74)
-    print(f"  {'TOTAL':<41} {g_exp:>10.2f} {g_paid:>10.2f} {g_exp-g_paid:>10.2f}")
+    print(f"  {'TOTAL':<42} {g_exp:>10.2f} {g_paid:>10.2f} {g_exp-g_paid:>10.2f}")
     con.close()
     pause()
 
 
 def defaulter_list():
     heading("Defaulter List")
-    threshold = get_float("  Show defaulters with dues above Rs. : ", minimum=0)
+    threshold = get_decimal("  Show defaulters with dues above Rs. : ", minimum=Decimal("0"))
     con = connect()
     if not con:
         return
@@ -738,23 +911,14 @@ def defaulter_list():
     defaulters = []
     for s in students:
         sid, name, cls, contact = s
-        enrolls = get_student_enrollments(cur, sid)
-        total_bal = 0.0
+        enrolls = get_student_enrollments(cur, sid, active_only=True)
+        total_bal = Decimal("0")
         tutor_names = []
         for e in enrolls:
-            cid, cname, subj, tutor, mfee = e
-            cur.execute("SELECT enrollment_date FROM enrollments WHERE student_id=%s AND course_id=%s", (sid, cid))
-            edate = cur.fetchone()[0]
-            months = (today.year - edate.year) * 12 + (today.month - edate.month) + 1
-            expected = float(mfee) * months
-            cur.execute(
-                "SELECT COALESCE(SUM(amount_paid),0) FROM payments WHERE student_id=%s AND course_id=%s",
-                (sid, cid)
-            )
-            paid = float(cur.fetchone()[0])
-            bal = expected - paid
-            if bal > 0:
-                total_bal += bal
+            cid, cname, subj, tutor, mfee, edate = e
+            expected, paid, balance, unpaid = calculate_dues(cur, sid, cid, edate, mfee)
+            if balance > 0:
+                total_bal += balance
                 tutor_names.append(tutor)
         if total_bal > threshold:
             tutors_str = ", ".join(tutor_names) if tutor_names else "N/A"
@@ -777,18 +941,41 @@ def fee_summary():
     print("  Leave blank to show ALL records.")
     raw_from = input("  From date (YYYY-MM-DD) : ").strip()
     raw_to   = input("  To   date (YYYY-MM-DD) : ").strip()
+
+    # Validate dates
+    from_date = None
+    to_date = None
+    if raw_from:
+        try:
+            from_date = datetime.strptime(raw_from, "%Y-%m-%d").date()
+        except ValueError:
+            print("  Invalid 'from' date. Use YYYY-MM-DD.")
+            pause()
+            return
+    if raw_to:
+        try:
+            to_date = datetime.strptime(raw_to, "%Y-%m-%d").date()
+        except ValueError:
+            print("  Invalid 'to' date. Use YYYY-MM-DD.")
+            pause()
+            return
+    if from_date and to_date and from_date > to_date:
+        print("  'From' date cannot be after 'to' date.")
+        pause()
+        return
+
     con = connect()
     if not con:
         return
     cur = con.cursor()
     params = []
     where  = ""
-    if raw_from and raw_to:
-        where, params = "WHERE p.payment_date BETWEEN %s AND %s", [raw_from, raw_to]
-    elif raw_from:
-        where, params = "WHERE p.payment_date >= %s", [raw_from]
-    elif raw_to:
-        where, params = "WHERE p.payment_date <= %s", [raw_to]
+    if from_date and to_date:
+        where, params = "WHERE p.payment_date BETWEEN %s AND %s", [from_date, to_date]
+    elif from_date:
+        where, params = "WHERE p.payment_date >= %s", [from_date]
+    elif to_date:
+        where, params = "WHERE p.payment_date <= %s", [to_date]
     cur.execute(
         "SELECT s.name, c.tutor_name, c.subject,"
         "       COUNT(p.payment_id), SUM(p.amount_paid)"
@@ -803,7 +990,24 @@ def fee_summary():
     cur.execute(
         f"SELECT COALESCE(SUM(amount_paid),0) FROM payments p {where}", params
     )
-    grand = float(cur.fetchone()[0])
+    grand = cur.fetchone()[0]
+    if grand is None:
+        grand = Decimal("0")
+
+    # Calculate total dues outstanding
+    cur.execute("SELECT student_id, name FROM students")
+    students = cur.fetchall()
+    total_dues = Decimal("0")
+    today = date.today()
+    for s in students:
+        sid, name = s
+        enrolls = get_student_enrollments(cur, sid, active_only=True)
+        for e in enrolls:
+            cid, cname, subj, tutor, mfee, edate = e
+            expected, paid, balance, unpaid = calculate_dues(cur, sid, cid, edate, mfee)
+            if balance > 0:
+                total_dues += balance
+
     con.close()
     if not rows:
         print("  No payment records in this period.")
@@ -811,9 +1015,10 @@ def fee_summary():
         print(f"\n  {'Student':<20} {'Tutor':<15} {'Subject':<15} {'#Payments':>9} {'Total':>12}")
         print("  " + "-" * 74)
         for r in rows:
-            print(f"  {r[0]:<20} {r[1]:<15} {r[2]:<15} {r[3]:>9} {float(r[4]):>12.2f}")
+            print(f"  {r[0]:<20} {r[1]:<15} {r[2]:<15} {r[3]:>9} {r[4]:>12.2f}")
         print("  " + "-" * 74)
         print(f"  {'GRAND TOTAL COLLECTED':>55} : Rs. {grand:.2f}")
+        print(f"  {'TOTAL DUES OUTSTANDING':>55} : Rs. {total_dues:.2f}")
     pause()
 
 
@@ -826,12 +1031,14 @@ def course_menu():
         heading("Course / Fee Structure")
         print("  1. Add new course")
         print("  2. View all courses")
-        print("  3. Delete a course")
+        print("  3. Edit a course")
+        print("  4. Delete a course")
         print("  0. Back")
         c = input("\n  Choice : ").strip()
         if   c == "1": add_course()
         elif c == "2": view_courses()
-        elif c == "3": delete_course()
+        elif c == "3": update_course()
+        elif c == "4": delete_course()
         elif c == "0": break
         else: print("  Invalid choice.")
 
